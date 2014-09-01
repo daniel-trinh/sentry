@@ -1,205 +1,114 @@
 defmodule Sentry do
-  use GenEvent
+  # use Application
 
-  def start do
-    {:ok, x} = GenEvent.start([name: __MODULE__])
-    # GenEvent.add_handler(x, __MODULE__, {})
+  import SentryUtil
 
-    stream = GenEvent.stream(x)
+  # def start(_type, _args) do
+  #   pid = case init do
+  #     {:ok, pid} ->
+  #       IO.puts("Starting Sentry (Automatic Code Compiler / Reloader\n")
+  #       pid
+  #     {:error, {:already_started, pid}} ->
+  #       IO.puts("Sentry already started\n")
+  #       pid
+  #   end
+  #   {:ok, pid}
+  # end
+  def init do
+    {:ok, sentry_state_pid} = Agent.start_link(fn -> %SentryState{} end, name: __MODULE__)
 
-    spawn_link fn ->
-      1..100 |> Enum.each fn num ->
-        GenEvent.notify(x, num)
+    modules_stream = Stream.concat([:ok], Streamz.Time.interval(30_000))
+    |> Stream.map(fn _x ->
+      modules = discover_loaded_modules
+      Agent.update(__MODULE__, fn state ->
+        %SentryState{state | modules: modules}
+      end)
+
+      # Update beams in SentryState
+      {_diff, _deleted} = compare_beams(sentry_state_pid, modules)
+
+      modules
+    end)
+
+    src_dirs_stream = modules_stream
+    |> Stream.map(fn modules ->
+      {src_dirs, hrl_dirs} = discover_src_dirs(sentry_state_pid, modules)
+      Agent.update(__MODULE__, fn state ->
+        %SentryState{state | src_dirs: src_dirs, hrl_dirs: hrl_dirs}
+      end)
+      {src_dirs, hrl_dirs}
+    end)
+
+    src_files_stream = src_dirs_stream
+    |> Stream.flat_map(fn dirs ->
+      Stream.concat([:ok], Streamz.Time.interval(5000))
+      |> Stream.take(6)
+      |> Stream.map(fn _x ->
+        {erl_files, ex_files} = discover_src_files(dirs)
+        Agent.update(__MODULE__, fn state ->
+          %SentryState{state | src_files: Enum.concat(erl_files,ex_files)}
+        end)
+        {erl_files, ex_files}
+      end)
+    end)
+
+    compare_src_files_stream = Streamz.Time.interval(1_000)
+    |> Stream.map(fn _x ->
+      file_last_mods = Agent.get(__MODULE__, fn state ->
+        state.src_files
+      end)
+      {diff, _new_files} = compare_src_files(sentry_state_pid, file_last_mods)
+
+      case diff do
+        [] ->
+          :no_change
+        [_h|_t] ->
+          # TODO: split into multiple commands
+          output = :os.cmd('mix do deps.compile, compile, dialyzer')
+          IO.puts(output)
+          :compiled
       end
-    end
-
-    stream
-    |> Stream.take(10)
-    |> Enum.each(fn num -> IO.puts "HI" end)
-  end
-
-  def handle_event(event, state) do
-    IO.puts event
-    state
-  end
-
-  def handle_call(event, state) do
-    IO.puts event
-    state
-  end
-
-  @spec discover_modules :: [module]
-  def discover_modules do
-    modules          = (:erlang.loaded -- :sync_utils.get_system_modules)
-    filtered_modules = :sync_scanner.filter_modules_to_scan(modules)
-    filtered_modules
-  end
-
-  @spec discover_src_dirs([module]) :: {[String.t], [String.t]}
-  def discover_src_dirs(modules) do
-    {src_dirs, hrl_dirs} = Enum.reduce(modules, {[], []},
-      fn elem, acc = {src_acc, hrl_acc} ->
-        case :sync_utils.get_src_dir_from_module(elem) do
-          {:ok, src_dir} ->
-            {:ok, options} = :sync_utils.get_options_from_module(elem)
-            :sync_options.set_options(src_dir, options)
-            hrl_dir = :proplists.get_value(:i, Options, [])
-            {[src_dir|src_acc], [hrl_dir|hrl_acc]}
-          :undefined ->
-            acc
-        end
     end)
 
-    {src_dirs |> Enum.uniq |> Enum.sort, hrl_dirs |> Enum.uniq |> Enum.sort }
-  end
+    # TODO: refactor streams
+    compare_beams_stream = compare_src_files_stream
+    |> Stream.filter(&(&1 == :compiled))
+    |> Stream.map(fn _x ->
+      module_refresh = discover_loaded_modules
 
+      beam_last_mods = Agent.update(__MODULE__, fn state ->
+        %SentryState{state | modules: module_refresh}
+      end)
 
-  @spec discover_src_files({[String.t], [String.t]}) :: {[String.t], [String.t]}
-  def discover_src_files({src_dirs, hrl_dirs}) do
-    {erl_files, ex_files} = Enum.reduce(src_dirs, [], fn elem, acc ->
-      :sync_utils.wildcard(elem, ".*\\.erl$") ++
-      :sync_utils.wildcard(elem, ".*\\.dtl$") ++
-      :sync_utils.wildcard(elem, ".*\\.ex$") ++
-      :sync_utils.wildcard(elem, ".*\\.exs$") ++ acc
+      {diff, deleted, _new_beam_lastmod} = compare_beams(sentry_state_pid, module_refresh)
+      case deleted do
+        [] ->
+          :no_change
+        [_h|_t] ->
+          IO.inspect(diff)
+          Enum.each(diff, fn {{module, beam_path}, last_mod} ->
+            IO.puts("Loading #{to_string(module)}...")
+            IEx.Helpers.l(module)
+          end)
+          IO.puts("Successfully reloaded modules.")
+          :reloaded
+      end
     end)
-    |> Enum.uniq
-    |> Enum.sort
-    |> Enum.partition(fn x ->
-      String.ends_with(x, ".erl") or String.ends_with(x, ".dtl")
+
+    _pid = spawn_link(fn ->
+      src_files_stream
+      |> Stream.each(fn x -> IO.inspect(x) end)
+      |> Stream.run
     end)
 
-    hrl_files = Enum.reduce(hrl_dirs, [], fn elem, acc ->
-      :sync_utils.wildcard(elem, ".*\\.hrl$") ++ acc
+    spawn_link(fn ->
+      compare_beams_stream
+      |> Stream.map(&IO.inspect&1)
+      |> Stream.run
     end)
-    |> Enum.uniq
-    |> Enum.sort
-
-    {erl_files, ex_files, hrl_files}
   end
 
-  @spec compare_beams([module]) :: [String.t]
-  def compare_beams(modules) do
-    Enum.map(modules, fn x ->
-      beam = :code.which(x)
-      last_mod = :filelib.last_modified(beam)
-      {x, last_mod}
-    end)
-    |> Enum.uniq
-    |> Enum.sort
-  end
-
-  @spec compare_src_files([String.t]) :: [String.t]
-  def compare_src_files(src_files) do
-    Enum.map(src_files, fn x ->
-      last_mod = :filelib.last_modified(x)
-      {x, last_mod}
-    end)
-    |> Enum.uniq
-    |> Enum.sort
-  end
-
-  # TODO: instead of using sorted lists, maybe use maps instead for comparing files?
-  def process_src_file_lastmod([{file, last_mod}|t1], [{file, last_mod} | t2]) do
-    # Beam hasn't changed, do nothing
-    process_src_file_lastmod(t1, t2)
-  end
-  def process_src_file_lastmod([{file, _}|t1], [{file, _}|t2]) do
-    # File has changed, recompile...
-    recompile_src_file(file)
-    process_src_file_lastmod(t1, t2)
-  end
-  def process_src_file_lastmod([{file1, last_mod1}|t1], [{file2, last_mod2}|t2]) do
-    # Lists are different...
-    case file1 < file2 do
-      # File was removed, do nothing...
-      true ->
-        process_src_file_lastmod(t1, [{file2, last_mod2}|t2])
-      false ->
-        maybe_recompile_src_file(file2, last_mod2)
-        process_src_file_lastmod([{file1, last_mod1}|t1], t2)
-    end
-  end
-  def process_src_file_lastmod([], [{file, last_mod}|t2]) do
-    maybe_recompile_src_file(file, last_mod)
-    process_src_file_lastmod([], t2)
-  end
-  def process_src_file_lastmod([], [], _) do
-    # Done.
-    :ok
-  end
-  def process_src_file_lastmod(:undefined, _Other, _) do
-    # First load, do nothing.
-    :ok
-  end
-
-  @spec recompile_src_file(String.t) :: :ok
-  def recompile_src_file(src_file) do
-    # Get the module, src dir, and options...
-    {:ok, src_dir} = :sync_utils.get_src_dir(src_file)
-    {compile_fun, module} = case :sync_utils.is_erldtl_template(src_file) do
-      false ->
-        {&(:compile.file/2), :erlang.list_to_atom(:filename.basename(src_file, ".erl"))}
-      true ->
-        {&(:erlydtl.compile/2), :erlang.list_to_atom(:lists.flatten(:filename.basename(src_file, ".dtl") ++ "_dtl"))}
-    end
-
-    # Get the old binary code...
-    old_binary = case :code.get_object_code(module) do
-      {^module, b, _filename} -> b
-      _ -> :undefined
-    end
-
-    case :sync_options.get_options(src_dir) do
-      {:ok, options} ->
-        case compile_fun.(src_file, [:binary, :return|options]) do
-          {:ok, module, ^old_binary, warnings} ->
-            # Compiling didn't change the beam code. Don't reload...
-            :sync_scanner.print_results(module, src_file, [], warnings)
-            {:ok, [], warnings}
-          {:ok, module, _binary, warnings} ->
-            # Compiling changed the beam code. Compile and reload.
-            compile_fun.(src_file, options)
-            case :code.ensure_loaded(module) do
-              {:module, ^module} -> :ok
-              {:error, :embedded} ->
-                # Module is not yet loaded, load it.
-                case :code.load_file(module) do
-                  {:module, ^module} -> :ok
-                end
-            end
-
-            # compare beamz use genevent
-
-            :sync_scanner.print_results(module, src_file, [], warnings)
-            {:ok, [], warnings}
-          {:error, errors, warnings} ->
-            ## compiling failed. print the warnings and errors...
-            :sync_scanner.print_results(module, src_file, errors, warnings)
-        end
-      :undefined ->
-        msg = "Unable to determine options for #{IO.inspect src_file}"
-        :sync_scanner.log_errors(msg)
-    end
-  end
-
-  @spec maybe_recompile_src_file(String.t, any) :: :ok
-  def maybe_recompile_src_file(file, last_mod) do
-    module = :erlang.list_to_atom(:filename.basename(file, ".erl"))
-
-    case :code.which(module) do
-      beam_file when is_list(beam_file) ->
-        case :filelib.last_modified(beam_file) do
-          beam_last_mod when last_mod > beam_last_mod ->
-            recompile_src_file(file)
-          _ ->
-            :ok
-        end
-      _ ->
-        # File is new, recompile...
-        recompile_src_file(file)
-    end
-  end
-
-  def compare_hrl_files do
+  def hello_world do
+    "hi"
   end
 end
