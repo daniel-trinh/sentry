@@ -136,13 +136,13 @@ defmodule SentryUtil do
 
     loaded_version = try do
       module_version(module.module_info)
-    catch _ ->
+    catch _, _ ->
       :error
     end
 
     current_version = try do
       module_version(:code.get_object_code(module))
-    catch _ ->
+    catch _, _ ->
       :error
     end
 

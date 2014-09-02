@@ -1,6 +1,6 @@
 defmodule Sentry do
   # use Application
-
+  require Logger
   import SentryUtil
 
   # TODO: figure out how to get this in a supervision tree
@@ -65,29 +65,21 @@ defmodule Sentry do
       end)
       {diff, _new_files} = compare_src_files(sentry_state_pid, src_files)
 
-      # TODO: move this into a separate
-      # case diff do
-      #   [] ->
-      #   [_h|_t] ->
-      #     # TODO: split into multiple commands
-      #     output = :os.cmd('mix do deps.compile, compile')
-      # end
-
       diff
     end)
 
     compile_stream = compare_src_files_stream
     |> Stream.filter(&(!Enum.empty?(&1)))
-    |> Stream.each(fn _ ->
+    |> Stream.map(fn _ ->
       # TODO: allow user to choose what commands they want to execute
       # on source file change
       output = :os.cmd('mix do deps.compile, compile')
-      IO.puts(output)
+      Logger.info(output)
+      :compiled
     end)
 
     # TODO: refactor streams
-    compare_beams_stream = compare_src_files_stream
-    |> Stream.filter(&(!Enum.empty?(&1)))
+    compare_beams_stream = compile_stream
     |> Stream.map(fn _x ->
 
       previous_modules = Agent.get(__MODULE__, &(&1.modules))
@@ -110,17 +102,17 @@ defmodule Sentry do
           Enum.each(diff, fn {module, reason} ->
             case reason do
               :deleted ->
-                # IO.puts("Module #{to_string(module)} has been removed from disk, purging from VM..")
+                Logger.info("\nModule #{to_string(module)} has been removed from disk, purging from VM..")
                 :code.purge(module)
               _ ->
-                IO.puts("Loading #{to_string(module)}...")
+                Logger.info("\nLoading #{to_string(module)}...")
                 # TODO: allow user to select if they want soft purge
                 # or hard purge
                 :code.soft_purge(module)
                 :code.load_file(module)
             end
           end)
-          IO.puts("Successfully reloaded modules.")
+          Logger.info("\nSuccessfully reloaded modules.")
           :reloaded
       end
     end)
@@ -131,12 +123,8 @@ defmodule Sentry do
     end)
 
     spawn_link(fn ->
-      compile_stream |> Stream.run
-    end)
-
-    spawn_link(fn ->
       compare_beams_stream
-      |> Stream.map(&IO.inspect&1)
+      |> Stream.map(&IO.inspect &1)
       |> Stream.run
     end)
   end
