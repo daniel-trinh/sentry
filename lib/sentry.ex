@@ -3,6 +3,10 @@ defmodule Sentry do
 
   import SentryUtil
 
+  # TODO: figure out how to get this in a supervision tree
+  # TODO: test to make sure Mix.Project works when this is used
+  # as a dependency
+
   # def start(_type, _args) do
   #   pid = case init do
   #     {:ok, pid} ->

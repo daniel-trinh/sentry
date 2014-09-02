@@ -29,7 +29,7 @@ defmodule Sentry.Mixfile do
   # Type `mix help deps` for more examples and options
   defp deps do
     [
-      {:sync, git: "git@github.com:daniel-trinh/sync.git"},
+      {:sync, git: "git@github.com:daniel-trinh/sync.git", branch: "master"},
       {:streamz, git: "git@github.com:hamiltop/streamz.git"}
     ]
   end
