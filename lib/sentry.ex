@@ -14,12 +14,14 @@ defmodule Sentry do
   #   end
   #   {:ok, pid}
   # end
+
+  # TODO: split out streams and actual running stream code
   def init do
     {:ok, sentry_state_pid} = Agent.start_link(fn -> %SentryState{} end, name: __MODULE__)
 
     modules_stream = Stream.concat([:ok], Streamz.Time.interval(30_000))
     |> Stream.map(fn _x ->
-      modules = discover_loaded_modules
+      modules = discover_compiled_modules
       Agent.update(__MODULE__, fn state ->
         %SentryState{state | modules: modules}
       end)
@@ -32,11 +34,11 @@ defmodule Sentry do
 
     src_dirs_stream = modules_stream
     |> Stream.map(fn modules ->
-      {src_dirs, hrl_dirs} = discover_src_dirs(sentry_state_pid, modules)
+      src_dirs = discover_src_dirs(sentry_state_pid, modules)
       Agent.update(__MODULE__, fn state ->
-        %SentryState{state | src_dirs: src_dirs, hrl_dirs: hrl_dirs}
+        %SentryState{state | src_dirs: src_dirs}
       end)
-      {src_dirs, hrl_dirs}
+      src_dirs
     end)
 
     src_files_stream = src_dirs_stream
@@ -54,41 +56,65 @@ defmodule Sentry do
 
     compare_src_files_stream = Streamz.Time.interval(1_000)
     |> Stream.map(fn _x ->
-      file_last_mods = Agent.get(__MODULE__, fn state ->
+      src_files = Agent.get(__MODULE__, fn state ->
         state.src_files
       end)
-      {diff, _new_files} = compare_src_files(sentry_state_pid, file_last_mods)
+      {diff, _new_files} = compare_src_files(sentry_state_pid, src_files)
+
+      # TODO: move this into a separate
+      # case diff do
+      #   [] ->
+      #   [_h|_t] ->
+      #     # TODO: split into multiple commands
+      #     output = :os.cmd('mix do deps.compile, compile')
+      # end
+
+      diff
+    end)
+
+    compile_stream = compare_src_files_stream
+    |> Stream.filter(&(!Enum.empty?(&1)))
+    |> Stream.each(fn _ ->
+      # TODO: allow user to choose what commands they want to execute
+      # on source file change
+      output = :os.cmd('mix do deps.compile, compile')
+      IO.puts(output)
+    end)
+
+    # TODO: refactor streams
+    compare_beams_stream = compare_src_files_stream
+    |> Stream.filter(&(!Enum.empty?(&1)))
+    |> Stream.map(fn _x ->
+
+      previous_modules = Agent.get(__MODULE__, &(&1.modules))
+      module_refresh = discover_compiled_modules
+
+      modules_before_and_after = Stream.concat(previous_modules, module_refresh)
+      |> Stream.uniq
+      |> Enum.to_list
+
+      Agent.update(__MODULE__, fn state ->
+        %SentryState{state | modules: module_refresh}
+      end)
+
+      diff = compare_beams2(modules_before_and_after)
 
       case diff do
         [] ->
           :no_change
         [_h|_t] ->
-          # TODO: split into multiple commands
-          output = :os.cmd('mix do deps.compile, compile, dialyzer')
-          IO.puts(output)
-          :compiled
-      end
-    end)
-
-    # TODO: refactor streams
-    compare_beams_stream = compare_src_files_stream
-    |> Stream.filter(&(&1 == :compiled))
-    |> Stream.map(fn _x ->
-      module_refresh = discover_loaded_modules
-
-      beam_last_mods = Agent.update(__MODULE__, fn state ->
-        %SentryState{state | modules: module_refresh}
-      end)
-
-      {diff, deleted, _new_beam_lastmod} = compare_beams(sentry_state_pid, module_refresh)
-      case deleted do
-        [] ->
-          :no_change
-        [_h|_t] ->
-          IO.inspect(diff)
-          Enum.each(diff, fn {{module, beam_path}, last_mod} ->
-            IO.puts("Loading #{to_string(module)}...")
-            IEx.Helpers.l(module)
+          Enum.each(diff, fn {module, reason} ->
+            case reason do
+              :deleted ->
+                # IO.puts("Module #{to_string(module)} has been removed from disk, purging from VM..")
+                :code.purge(module)
+              _ ->
+                IO.puts("Loading #{to_string(module)}...")
+                # TODO: allow user to select if they want soft purge
+                # or hard purge
+                :code.soft_purge(module)
+                :code.load_file(module)
+            end
           end)
           IO.puts("Successfully reloaded modules.")
           :reloaded
@@ -97,8 +123,11 @@ defmodule Sentry do
 
     _pid = spawn_link(fn ->
       src_files_stream
-      |> Stream.each(fn x -> IO.inspect(x) end)
       |> Stream.run
+    end)
+
+    spawn_link(fn ->
+      compile_stream |> Stream.run
     end)
 
     spawn_link(fn ->
@@ -108,7 +137,4 @@ defmodule Sentry do
     end)
   end
 
-  def hello_world do
-    "hi"
-  end
 end

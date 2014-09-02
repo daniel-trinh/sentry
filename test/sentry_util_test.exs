@@ -6,6 +6,11 @@ defmodule SentryUtiltest do
     assert Enum.member?(modules, SentryUtil) == true
   end
 
+  test "discover_compiled_modules" do
+    modules = SentryUtil.discover_compiled_modules
+    assert Enum.member?(modules, SentryUtil) == true
+  end
+
   test "discover_src_dirs" do
     {:ok, pid} = Agent.start_link(fn -> %SentryState{} end, name: Sentry)
     modules    = SentryUtil.discover_loaded_modules
@@ -21,7 +26,6 @@ defmodule SentryUtiltest do
     modules    = SentryUtil.discover_loaded_modules
     dirs       = SentryUtil.discover_src_dirs(pid, modules)
 
-    IO.inspect dirs
     {erl_files, ex_files} = SentryUtil.discover_src_files(dirs)
 
     Enum.each(erl_files, fn x ->
@@ -53,5 +57,29 @@ defmodule SentryUtiltest do
   end
 
   test "discover_beam_files" do
+    {erl_beams, ex_beams} = SentryUtil.discover_beam_files
+    Enum.each(erl_beams, fn x ->
+      assert String.match?(x,  ~r/.*ebin\/Elixir\.(.*)\.beam/) == false
+      assert String.ends_with?(x, ".beam") == true
+    end)
+    Enum.each(ex_beams, fn x ->
+      assert String.match?(x,  ~r/.*ebin\/Elixir\.(.*)\.beam/) == true
+      assert String.ends_with?(x, ".beam") == true
+    end)
+  end
+  test "module_from_beam_path" do
+    {erl_beams, ex_beams} = SentryUtil.discover_beam_files
+    Enum.each(erl_beams, fn x ->
+      assert String.match?(x,  ~r/.*ebin\/Elixir\.(.*)\.beam/) == false
+      assert String.ends_with?(x, ".beam") == true
+    end)
+    Enum.each(ex_beams, fn x ->
+      assert String.match?(x,  ~r/.*ebin\/Elixir\.(.*)\.beam/) == true
+      assert String.ends_with?(x, ".beam") == true
+    end)
+  end
+
+  test "changed?" do
+    assert SentryUtil.changed?(Enum) == :no_change
   end
 end
